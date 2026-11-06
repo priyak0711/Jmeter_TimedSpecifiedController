@@ -10,41 +10,50 @@ import org.apache.jmeter.threads.JMeterContextService;
 /**
  * Timed Specified Controller.
  *
- * Runs its children based on elapsed test time. Two modes:
- *  - ONCE (default): children run exactly once, the first time the elapsed test
- *    time reaches the configured interval (like a time-triggered Once Only Controller).
- *  - REPEAT: children run every time the configured interval has elapsed.
+ * Two independent parts that can be combined:
+ *  - "Run once at test start" (check box): the children run once, in the first
+ *    iteration after the test starts (same as the Once Only Controller).
+ *  - Timed run (mode ONCE or REPEAT): the children run when the configured interval
+ *    of test time has elapsed - once (ONCE) or every time it elapses (REPEAT).
  *
  * Scope:
- *  - per thread (default): every thread keeps its own schedule.
+ *  - per thread (default): every thread follows the schedule on its own.
  *  - global: one schedule for the whole test; only one thread runs the children
- *    for each due time.
+ *    for the start run and for each due time.
  *
- * Note: the controller is only evaluated when a thread loops past it, so keep
- * a sampler (for example a Flow Control Action pause) beside it in the Thread
- * Group. The actual run time is the first loop iteration at or after the due time.
+ * Keep a sampler (for example a Flow Control Action pause) beside the controller
+ * in the Thread Group, so every iteration has something to run while the timed
+ * part is waiting.
  */
 public class TimedSpecifiedController extends GenericController implements Serializable {
 
-    private static final long serialVersionUID = 2L;
+    private static final long serialVersionUID = 4L;
 
     public static final String INTERVAL = "TimedSpecifiedController.interval";
     public static final String UNIT = "TimedSpecifiedController.unit";
+    public static final String MODE = "TimedSpecifiedController.mode";
+    public static final String RUN_AT_START = "TimedSpecifiedController.runAtStart";
+    /** Legacy boolean from an older version, used only when MODE is not set. */
     public static final String REPEAT = "TimedSpecifiedController.repeat";
     public static final String GLOBAL_SCOPE = "TimedSpecifiedController.globalScope";
 
     public static final String UNIT_SECONDS = "Seconds";
     public static final String UNIT_MINUTES = "Minutes";
 
+    public static final String MODE_ONCE = "ONCE";
+    public static final String MODE_REPEAT = "REPEAT";
+
     // Shared state for "global" scope.
     private static final Object GLOBAL_LOCK = new Object();
     private static long globalTestStart = -1;
     private static long globalNextDue;
-    private static boolean globalFired;
+    private static boolean globalTimedFired;
+    private static boolean globalStartFired;
 
     // Per-thread state (JMeter clones the controller for every thread).
     private transient boolean running;
-    private transient boolean executed;
+    private transient boolean startDone;
+    private transient boolean timedDone;
     private transient long nextDue = -1;
 
     // ---- properties -------------------------------------------------------
@@ -72,12 +81,26 @@ public class TimedSpecifiedController extends GenericController implements Seria
         setProperty(UNIT, unit);
     }
 
-    public boolean isRepeat() {
-        return getPropertyAsBoolean(REPEAT, false);
+    public String getMode() {
+        String mode = getPropertyAsString(MODE, "");
+        if (MODE_ONCE.equals(mode) || MODE_REPEAT.equals(mode)) {
+            return mode;
+        }
+        // older saved plans: "START" or nothing at all
+        return getPropertyAsBoolean(REPEAT, false) ? MODE_REPEAT : MODE_ONCE;
     }
 
-    public void setRepeat(boolean repeat) {
-        setProperty(REPEAT, repeat);
+    public void setMode(String mode) {
+        setProperty(MODE, mode);
+    }
+
+    public boolean isRunAtStart() {
+        return getPropertyAsBoolean(RUN_AT_START, false)
+                || "START".equals(getPropertyAsString(MODE, ""));
+    }
+
+    public void setRunAtStart(boolean runAtStart) {
+        setProperty(RUN_AT_START, runAtStart);
     }
 
     public boolean isGlobalScope() {
@@ -129,17 +152,27 @@ public class TimedSpecifiedController extends GenericController implements Seria
 
     /** Decides whether the children should start now, and updates the schedule if so. */
     private boolean isDue() {
-        boolean repeat = isRepeat();
-        if (!repeat && executed) {
-            return false;
-        }
-
         long now = System.currentTimeMillis();
         long testStart = JMeterContextService.getTestStartTime();
+        boolean global = isGlobalScope();
+
+        // 1. start run (once at the beginning of the test)
+        if (isRunAtStart() && !startDone) {
+            startDone = true;
+            if (!global || claimGlobalStart(testStart)) {
+                return true;
+            }
+        }
+
+        // 2. timed run (after the interval, once or repeatedly)
+        boolean repeat = MODE_REPEAT.equals(getMode());
+        if (!repeat && timedDone) {
+            return false;
+        }
         long interval = intervalMillis();
 
-        if (isGlobalScope()) {
-            return claimGlobal(repeat, now, testStart, interval);
+        if (global) {
+            return claimGlobalTimed(repeat, now, testStart, interval);
         }
 
         if (nextDue < 0) {
@@ -151,20 +184,39 @@ public class TimedSpecifiedController extends GenericController implements Seria
         if (repeat) {
             nextDue = advance(nextDue, now, interval);
         } else {
-            executed = true;
+            timedDone = true;
         }
         return true;
     }
 
-    private static boolean claimGlobal(boolean repeat, long now, long testStart, long interval) {
+    private static void resetGlobalIfNewTest(long testStart, long interval) {
+        if (globalTestStart != testStart) {
+            globalTestStart = testStart;
+            globalNextDue = testStart + interval;
+            globalTimedFired = false;
+            globalStartFired = false;
+        }
+    }
+
+    private static boolean claimGlobalStart(long testStart) {
         synchronized (GLOBAL_LOCK) {
-            if (globalTestStart != testStart) {
-                // new test run: reset the shared schedule
-                globalTestStart = testStart;
-                globalNextDue = testStart + interval;
-                globalFired = false;
+            resetGlobalIfNewTest(testStart, Long.MAX_VALUE / 4);
+            if (globalStartFired) {
+                return false;
             }
-            if (!repeat && globalFired) {
+            globalStartFired = true;
+            return true;
+        }
+    }
+
+    private boolean claimGlobalTimed(boolean repeat, long now, long testStart, long interval) {
+        synchronized (GLOBAL_LOCK) {
+            resetGlobalIfNewTest(testStart, interval);
+            // the shared due time may have been initialised by the start claim
+            if (globalNextDue > testStart + interval) {
+                globalNextDue = testStart + interval;
+            }
+            if (!repeat && globalTimedFired) {
                 return false;
             }
             if (now < globalNextDue) {
@@ -173,7 +225,7 @@ public class TimedSpecifiedController extends GenericController implements Seria
             if (repeat) {
                 globalNextDue = advance(globalNextDue, now, interval);
             } else {
-                globalFired = true;
+                globalTimedFired = true;
             }
             return true;
         }
